@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from accelerate import Accelerator
 from einops import rearrange, reduce
+
 # from einops.layers.torch import Rearrange
 from ema_pytorch import EMA
 import time
@@ -27,9 +28,93 @@ import importlib
 from PIL import Image
 
 ModelResPrediction = namedtuple(
-    'ModelResPrediction', ['pred_res', 'pred_noise', 'pred_x_start'])
+    "ModelResPrediction", ["pred_res", "pred_noise", "pred_x_start"]
+)
 # helpers functions
-metric_module = importlib.import_module('metrics')
+metric_module = importlib.import_module("metrics")
+
+
+class DataEquilibriumScheduler:
+    """Data Equilibrium Scheduler for V2 - FoundIR-v2 paper
+    Dynamically adjusts sampling weights for different degradation types during training.
+    Based on the data mixing law to ensure balanced dataset composition.
+    """
+
+    def __init__(
+        self, task_types, initial_weights=None, equilibrium_interval=1000, lr=0.01
+    ):
+        self.task_types = task_types
+        self.num_tasks = len(task_types)
+        self.equilibrium_interval = equilibrium_interval
+        self.lr = lr
+
+        if initial_weights is None:
+            self.weights = torch.ones(self.num_tasks) / self.num_tasks
+        else:
+            self.weights = torch.tensor(initial_weights, dtype=torch.float32)
+            self.weights = self.weights / self.weights.sum()
+
+        self.task_losses = {task: [] for task in task_types}
+        self.task_counts = {task: 0 for task in task_types}
+        self.current_step = 0
+
+    def update(self, task_names, losses):
+        """Update task weights based on recent losses.
+
+        Args:
+            task_names: list of task type names for each sample in batch
+            losses: list of loss values for each sample
+        """
+        for task_name, loss in zip(task_names, losses):
+            if task_name in self.task_types:
+                self.task_losses[task_name].append(
+                    loss.item() if torch.is_tensor(loss) else loss
+                )
+                self.task_counts[task_name] += 1
+
+        self.current_step += 1
+
+        if self.current_step % self.equilibrium_interval == 0:
+            self._adjust_weights()
+
+    def _adjust_weights(self):
+        """Adjust sampling weights to achieve equilibrium based on loss magnitude."""
+        avg_losses = []
+        for task in self.task_types:
+            if len(self.task_losses[task]) > 0:
+                avg_loss = np.mean(self.task_losses[task])
+            else:
+                avg_loss = 1.0
+            avg_losses.append(avg_loss)
+
+        avg_losses = torch.tensor(avg_losses, dtype=torch.float32)
+
+        target_weights = torch.ones(self.num_tasks) / self.num_tasks
+
+        loss_diff = avg_losses / (avg_losses.mean() + 1e-8)
+
+        adjusted = self.weights + self.lr * (target_weights - loss_diff * self.weights)
+        self.weights = torch.clamp(adjusted, min=0.05)
+        self.weights = self.weights / self.weights.sum()
+
+        for task in self.task_types:
+            self.task_losses[task] = []
+
+    def get_weights(self):
+        """Return current sampling weights."""
+        return self.weights
+
+    def sample_task(self, num_samples):
+        """Sample task indices based on current weights."""
+        return torch.multinomial(self.weights, num_samples, replacement=True)
+
+    def get_task_weight(self, task_name):
+        """Get weight for a specific task."""
+        if task_name in self.task_types:
+            idx = self.task_types.index(task_name)
+            return self.weights[idx].item()
+        return 1.0 / self.num_tasks
+
 
 def set_seed(SEED):
     # initialize random seed
@@ -37,6 +122,7 @@ def set_seed(SEED):
     torch.cuda.manual_seed_all(SEED)
     np.random.seed(SEED)
     random.seed(SEED)
+
 
 def tensor2img(tensor, rgb2bgr=True, out_type=np.uint8, min_max=(0, 1)):
     """Convert torch Tensors into image numpy arrays.
@@ -59,11 +145,11 @@ def tensor2img(tensor, rgb2bgr=True, out_type=np.uint8, min_max=(0, 1)):
         (Tensor or list): 3D ndarray of shape (H x W x C) OR 2D ndarray of
         shape (H x W). The channel order is BGR.
     """
-    if not (torch.is_tensor(tensor) or
-            (isinstance(tensor, list)
-             and all(torch.is_tensor(t) for t in tensor))):
-        raise TypeError(
-            f'tensor or list of tensors expected, got {type(tensor)}')
+    if not (
+        torch.is_tensor(tensor)
+        or (isinstance(tensor, list) and all(torch.is_tensor(t) for t in tensor))
+    ):
+        raise TypeError(f"tensor or list of tensors expected, got {type(tensor)}")
 
     if torch.is_tensor(tensor):
         tensor = [tensor]
@@ -75,8 +161,8 @@ def tensor2img(tensor, rgb2bgr=True, out_type=np.uint8, min_max=(0, 1)):
         n_dim = _tensor.dim()
         if n_dim == 4:
             img_np = make_grid(
-                _tensor, nrow=int(math.sqrt(_tensor.size(0))),
-                normalize=False).numpy()
+                _tensor, nrow=int(math.sqrt(_tensor.size(0))), normalize=False
+            ).numpy()
             img_np = img_np.transpose(1, 2, 0)
             if rgb2bgr:
                 img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
@@ -91,8 +177,10 @@ def tensor2img(tensor, rgb2bgr=True, out_type=np.uint8, min_max=(0, 1)):
         elif n_dim == 2:
             img_np = _tensor.numpy()
         else:
-            raise TypeError('Only support 4D, 3D or 2D tensor. '
-                            f'But received with dimension: {n_dim}')
+            raise TypeError(
+                "Only support 4D, 3D or 2D tensor. "
+                f"But received with dimension: {n_dim}"
+            )
         if out_type == np.uint8:
             # Unlike MATLAB, numpy.unit8() WILL NOT round by default.
             img_np = (img_np * 255.0).round()
@@ -101,6 +189,7 @@ def tensor2img(tensor, rgb2bgr=True, out_type=np.uint8, min_max=(0, 1)):
     if len(result) == 1:
         result = result[0]
     return result
+
 
 def exists(x):
     return x is not None
@@ -151,6 +240,7 @@ def unnormalize_to_zero_to_one(img):
     else:
         return (img + 1) * 0.5
 
+
 # small helper modules
 
 
@@ -165,8 +255,8 @@ class Residual(nn.Module):
 
 def Upsample(dim, dim_out=None):
     return nn.Sequential(
-        nn.Upsample(scale_factor=2, mode='nearest'),
-        nn.Conv2d(dim, default(dim_out, dim), 3, padding=1)
+        nn.Upsample(scale_factor=2, mode="nearest"),
+        nn.Conv2d(dim, default(dim_out, dim), 3, padding=1),
     )
 
 
@@ -184,12 +274,19 @@ class WeightStandardizedConv2d(nn.Conv2d):
         eps = 1e-5 if x.dtype == torch.float32 else 1e-3
 
         weight = self.weight
-        mean = reduce(weight, 'o ... -> o 1 1 1', 'mean')
-        var = reduce(weight, 'o ... -> o 1 1 1',
-                     partial(torch.var, unbiased=False))
+        mean = reduce(weight, "o ... -> o 1 1 1", "mean")
+        var = reduce(weight, "o ... -> o 1 1 1", partial(torch.var, unbiased=False))
         normalized_weight = (weight - mean) * (var + eps).rsqrt()
 
-        return F.conv2d(x, normalized_weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+        return F.conv2d(
+            x,
+            normalized_weight,
+            self.bias,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+        )
 
 
 class LayerNorm(nn.Module):
@@ -214,6 +311,7 @@ class PreNorm(nn.Module):
         x = self.norm(x)
         return self.fn(x)
 
+
 # sinusoidal positional embeds
 
 
@@ -233,22 +331,23 @@ class SinusoidalPosEmb(nn.Module):
 
 
 class RandomOrLearnedSinusoidalPosEmb(nn.Module):
-    """ following @crowsonkb 's lead with random (learned optional) sinusoidal pos emb """
+    """following @crowsonkb 's lead with random (learned optional) sinusoidal pos emb"""
+
     """ https://github.com/crowsonkb/v-diffusion-jax/blob/master/diffusion/models/danbooru_128.py#L8 """
 
     def __init__(self, dim, is_random=False):
         super().__init__()
         assert (dim % 2) == 0
         half_dim = dim // 2
-        self.weights = nn.Parameter(torch.randn(
-            half_dim), requires_grad=not is_random)
+        self.weights = nn.Parameter(torch.randn(half_dim), requires_grad=not is_random)
 
     def forward(self, x):
-        x = rearrange(x, 'b -> b 1')
-        freqs = x * rearrange(self.weights, 'd -> 1 d') * 2 * math.pi
+        x = rearrange(x, "b -> b 1")
+        freqs = x * rearrange(self.weights, "d -> 1 d") * 2 * math.pi
         fouriered = torch.cat((freqs.sin(), freqs.cos()), dim=-1)
         fouriered = torch.cat((x, fouriered), dim=-1)
         return fouriered
+
 
 # building block modules
 
@@ -275,22 +374,22 @@ class Block(nn.Module):
 class ResnetBlock(nn.Module):
     def __init__(self, dim, dim_out, *, time_emb_dim=None, groups=8):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(time_emb_dim, dim_out * 2)
-        ) if exists(time_emb_dim) else None
+        self.mlp = (
+            nn.Sequential(nn.SiLU(), nn.Linear(time_emb_dim, dim_out * 2))
+            if exists(time_emb_dim)
+            else None
+        )
 
         self.block1 = Block(dim, dim_out, groups=groups)
         self.block2 = Block(dim_out, dim_out, groups=groups)
-        self.res_conv = nn.Conv2d(
-            dim, dim_out, 1) if dim != dim_out else nn.Identity()
+        self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
     def forward(self, x, time_emb=None):
 
         scale_shift = None
         if exists(self.mlp) and exists(time_emb):
             time_emb = self.mlp(time_emb)
-            time_emb = rearrange(time_emb, 'b c -> b c 1 1')
+            time_emb = rearrange(time_emb, "b c -> b c 1 1")
             scale_shift = time_emb.chunk(2, dim=1)
 
         h = self.block1(x, scale_shift=scale_shift)
@@ -303,21 +402,19 @@ class ResnetBlock(nn.Module):
 class LinearAttention(nn.Module):
     def __init__(self, dim, heads=4, dim_head=32):
         super().__init__()
-        self.scale = dim_head ** -0.5
+        self.scale = dim_head**-0.5
         self.heads = heads
         hidden_dim = dim_head * heads
         self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias=False)
 
-        self.to_out = nn.Sequential(
-            nn.Conv2d(hidden_dim, dim, 1),
-            LayerNorm(dim)
-        )
+        self.to_out = nn.Sequential(nn.Conv2d(hidden_dim, dim, 1), LayerNorm(dim))
 
     def forward(self, x):
         b, c, h, w = x.shape
         qkv = self.to_qkv(x).chunk(3, dim=1)
-        q, k, v = map(lambda t: rearrange(
-            t, 'b (h c) x y -> b h c (x y)', h=self.heads), qkv)
+        q, k, v = map(
+            lambda t: rearrange(t, "b (h c) x y -> b h c (x y)", h=self.heads), qkv
+        )
 
         q = q.softmax(dim=-2)
         k = k.softmax(dim=-1)
@@ -325,18 +422,17 @@ class LinearAttention(nn.Module):
         q = q * self.scale
         v = v / (h * w)
 
-        context = torch.einsum('b h d n, b h e n -> b h d e', k, v)
+        context = torch.einsum("b h d n, b h e n -> b h d e", k, v)
 
-        out = torch.einsum('b h d e, b h d n -> b h e n', context, q)
-        out = rearrange(out, 'b h c (x y) -> b (h c) x y',
-                        h=self.heads, x=h, y=w)
+        out = torch.einsum("b h d e, b h d n -> b h e n", context, q)
+        out = rearrange(out, "b h c (x y) -> b (h c) x y", h=self.heads, x=h, y=w)
         return self.to_out(out)
 
 
 class Attention(nn.Module):
     def __init__(self, dim, heads=4, dim_head=32):
         super().__init__()
-        self.scale = dim_head ** -0.5
+        self.scale = dim_head**-0.5
         self.heads = heads
         hidden_dim = dim_head * heads
 
@@ -346,16 +442,17 @@ class Attention(nn.Module):
     def forward(self, x):
         b, c, h, w = x.shape
         qkv = self.to_qkv(x).chunk(3, dim=1)
-        q, k, v = map(lambda t: rearrange(
-            t, 'b (h c) x y -> b h c (x y)', h=self.heads), qkv)
+        q, k, v = map(
+            lambda t: rearrange(t, "b (h c) x y -> b h c (x y)", h=self.heads), qkv
+        )
 
         q = q * self.scale
 
-        sim = einsum('b h d i, b h d j -> b h i j', q, k)
+        sim = einsum("b h d i, b h d j -> b h i j", q, k)
         attn = sim.softmax(dim=-1)
-        out = einsum('b h i j, b h d j -> b h i d', attn, v)
+        out = einsum("b h i j, b h d j -> b h i d", attn, v)
 
-        out = rearrange(out, 'b h (x y) d -> b (h d) x y', x=h, y=w)
+        out = rearrange(out, "b h (x y) d -> b (h d) x y", x=h, y=w)
         return self.to_out(out)
 
 
@@ -394,11 +491,14 @@ class Unet(nn.Module):
 
         time_dim = dim * 4
 
-        self.random_or_learned_sinusoidal_cond = learned_sinusoidal_cond or random_fourier_features
+        self.random_or_learned_sinusoidal_cond = (
+            learned_sinusoidal_cond or random_fourier_features
+        )
 
         if self.random_or_learned_sinusoidal_cond:
             sinu_pos_emb = RandomOrLearnedSinusoidalPosEmb(
-                learned_sinusoidal_dim, random_fourier_features)
+                learned_sinusoidal_dim, random_fourier_features
+            )
             fourier_dim = learned_sinusoidal_dim + 1
         else:
             sinu_pos_emb = SinusoidalPosEmb(dim)
@@ -408,7 +508,7 @@ class Unet(nn.Module):
             sinu_pos_emb,
             nn.Linear(fourier_dim, time_dim),
             nn.GELU(),
-            nn.Linear(time_dim, time_dim)
+            nn.Linear(time_dim, time_dim),
         )
 
         # layers
@@ -420,13 +520,18 @@ class Unet(nn.Module):
         for ind, (dim_in, dim_out) in enumerate(in_out):
             is_last = ind >= (num_resolutions - 1)
 
-            self.downs.append(nn.ModuleList([
-                block_klass(dim_in, dim_in, time_emb_dim=time_dim),
-                block_klass(dim_in, dim_in, time_emb_dim=time_dim),
-                Residual(PreNorm(dim_in, LinearAttention(dim_in))),
-                Downsample(dim_in, dim_out) if not is_last else nn.Conv2d(
-                    dim_in, dim_out, 3, padding=1)
-            ]))
+            self.downs.append(
+                nn.ModuleList(
+                    [
+                        block_klass(dim_in, dim_in, time_emb_dim=time_dim),
+                        block_klass(dim_in, dim_in, time_emb_dim=time_dim),
+                        Residual(PreNorm(dim_in, LinearAttention(dim_in))),
+                        Downsample(dim_in, dim_out)
+                        if not is_last
+                        else nn.Conv2d(dim_in, dim_out, 3, padding=1),
+                    ]
+                )
+            )
 
         mid_dim = dims[-1]
         self.mid_block1 = block_klass(mid_dim, mid_dim, time_emb_dim=time_dim)
@@ -436,13 +541,18 @@ class Unet(nn.Module):
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
             is_last = ind == (len(in_out) - 1)
 
-            self.ups.append(nn.ModuleList([
-                block_klass(dim_out + dim_in, dim_out, time_emb_dim=time_dim),
-                block_klass(dim_out + dim_in, dim_out, time_emb_dim=time_dim),
-                Residual(PreNorm(dim_out, LinearAttention(dim_out))),
-                Upsample(dim_out, dim_in) if not is_last else nn.Conv2d(
-                    dim_out, dim_in, 3, padding=1)
-            ]))
+            self.ups.append(
+                nn.ModuleList(
+                    [
+                        block_klass(dim_out + dim_in, dim_out, time_emb_dim=time_dim),
+                        block_klass(dim_out + dim_in, dim_out, time_emb_dim=time_dim),
+                        Residual(PreNorm(dim_out, LinearAttention(dim_out))),
+                        Upsample(dim_out, dim_in)
+                        if not is_last
+                        else nn.Conv2d(dim_out, dim_in, 3, padding=1),
+                    ]
+                )
+            )
 
         default_out_dim = channels * (1 if not learned_variance else 2)
         self.out_dim = default(out_dim, default_out_dim)
@@ -454,9 +564,9 @@ class Unet(nn.Module):
         s = int(math.pow(2, self.depth))
         mod_pad_h = (s - h % s) % s
         mod_pad_w = (s - w % s) % s
-        x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), 'reflect')
+        x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), "reflect")
         return x
-    
+
     def forward(self, x, time):
         H, W = x.shape[2:]
         x = self.check_image_size(x, H, W)
@@ -514,31 +624,35 @@ class UnetRes(nn.Module):
         learned_sinusoidal_dim=16,
         num_unet=1,
         condition=False,
-        objective='pred_res_noise',
-        test_res_or_noise="res_noise"
+        objective="pred_res_noise",
+        test_res_or_noise="res_noise",
     ):
         super().__init__()
         self.condition = condition
         self.channels = channels
         default_out_dim = channels * (1 if not learned_variance else 2)
         self.out_dim = default(out_dim, default_out_dim)
-        self.random_or_learned_sinusoidal_cond = learned_sinusoidal_cond or random_fourier_features
+        self.random_or_learned_sinusoidal_cond = (
+            learned_sinusoidal_cond or random_fourier_features
+        )
         self.num_unet = num_unet
         self.objective = objective
         self.test_res_or_noise = test_res_or_noise
         # determine dimensions
-    
-        self.unet0 = Unet(dim,
-                        init_dim=init_dim,
-                        out_dim=out_dim,
-                        dim_mults=dim_mults,
-                        channels=channels,
-                        resnet_block_groups=resnet_block_groups,
-                        learned_variance=learned_variance,
-                        learned_sinusoidal_cond=learned_sinusoidal_cond,
-                        random_fourier_features=random_fourier_features,
-                        learned_sinusoidal_dim=learned_sinusoidal_dim,
-                        condition=condition)
+
+        self.unet0 = Unet(
+            dim,
+            init_dim=init_dim,
+            out_dim=out_dim,
+            dim_mults=dim_mults,
+            channels=channels,
+            resnet_block_groups=resnet_block_groups,
+            learned_variance=learned_variance,
+            learned_sinusoidal_cond=learned_sinusoidal_cond,
+            random_fourier_features=random_fourier_features,
+            learned_sinusoidal_dim=learned_sinusoidal_dim,
+            condition=condition,
+        )
 
     def forward(self, x, time):
         if self.objective == "pred_noise":
@@ -546,6 +660,7 @@ class UnetRes(nn.Module):
         elif self.objective == "pred_res":
             time = time[0]
         return [self.unet0(x, time)]
+
 
 # gaussian diffusion trainer class
 
@@ -562,32 +677,35 @@ def gen_coefficients(timesteps, schedule="increased", sum_scale=1, ratio=1):
         y = x**ratio
         y = torch.from_numpy(y)
         y_sum = y.sum()
-        alphas = y/y_sum
+        alphas = y / y_sum
     elif schedule == "decreased":
         x = np.linspace(0, 1, timesteps, dtype=np.float32)
         y = x**ratio
         y = torch.from_numpy(y)
         y_sum = y.sum()
         y = torch.flip(y, dims=[0])
-        alphas = y/y_sum
+        alphas = y / y_sum
     elif schedule == "lamda":
         x = np.linspace(0.0001, 0.02, timesteps, dtype=np.float32)
         y = x**ratio
         y = torch.from_numpy(y)
         alphas = 1 - y
     elif schedule == "average":
-        alphas = torch.full([timesteps], 1/timesteps, dtype=torch.float32)
+        alphas = torch.full([timesteps], 1 / timesteps, dtype=torch.float32)
     elif schedule == "normal":
         sigma = 1.0
         mu = 0.0
-        x = np.linspace(-3+mu, 3+mu, timesteps, dtype=np.float32)
-        y = np.e**(-((x-mu)**2)/(2*(sigma**2)))/(np.sqrt(2*np.pi)*(sigma**2))
+        x = np.linspace(-3 + mu, 3 + mu, timesteps, dtype=np.float32)
+        y = np.e ** (-((x - mu) ** 2) / (2 * (sigma**2))) / (
+            np.sqrt(2 * np.pi) * (sigma**2)
+        )
         y = torch.from_numpy(y)
-        alphas = y/y.sum()
+        alphas = y / y.sum()
     else:
-        alphas = torch.full([timesteps], 1/timesteps, dtype=torch.float32)
+        alphas = torch.full([timesteps], 1 / timesteps, dtype=torch.float32)
 
-    return alphas*sum_scale
+    return alphas * sum_scale
+
 
 # Copied from diffusers.schedulers.scheduling_ddpm.betas_for_alpha_bar
 def betas_for_alpha_bar(num_diffusion_timesteps, max_beta=0.999) -> torch.Tensor:
@@ -626,18 +744,17 @@ class ResidualDiffusion(nn.Module):
         *,
         image_size,
         timesteps=1000,
-        delta_end = 1.5e-3,
+        delta_end=1.5e-3,
         sampling_timesteps=None,
-        loss_type='l1',
-        objective='pred_res_noise',
-        ddim_sampling_eta=0.,
+        loss_type="l1",
+        objective="pred_res_noise",
+        ddim_sampling_eta=0.0,
         condition=False,
         sum_scale=None,
         test_res_or_noise="None",
     ):
         super().__init__()
-        assert not (
-            type(self) == ResidualDiffusion and model.channels != model.out_dim)
+        assert not (type(self) == ResidualDiffusion and model.channels != model.out_dim)
         assert not model.random_or_learned_sinusoidal_cond
 
         self.model = model
@@ -652,46 +769,57 @@ class ResidualDiffusion(nn.Module):
             self.sum_scale = sum_scale if sum_scale else 0.01
             # ddim_sampling_eta = 0.25
         else:
-            self.sum_scale = sum_scale if sum_scale else 1.
+            self.sum_scale = sum_scale if sum_scale else 1.0
 
         beta_schedule = "linear"
         beta_start = 0.0001
         beta_end = 0.02
         if beta_schedule == "linear":
-            betas = torch.linspace(beta_start, beta_end, timesteps, dtype=torch.float32) # [0.0001, ... ,0.02]
+            betas = torch.linspace(
+                beta_start, beta_end, timesteps, dtype=torch.float32
+            )  # [0.0001, ... ,0.02]
         elif beta_schedule == "scaled_linear":
             # this schedule is very specific to the latent diffusion model.
-            betas = (torch.linspace(beta_start**0.5, beta_end**0.5, timesteps, dtype=torch.float32) ** 2)
+            betas = (
+                torch.linspace(
+                    beta_start**0.5, beta_end**0.5, timesteps, dtype=torch.float32
+                )
+                ** 2
+            )
         elif beta_schedule == "squaredcos_cap_v2":
             # Glide cosine schedule
             betas = betas_for_alpha_bar(timesteps)
         else:
-            raise NotImplementedError(f"{beta_schedule} does is not implemented for {self.__class__}")
-            
+            raise NotImplementedError(
+                f"{beta_schedule} does is not implemented for {self.__class__}"
+            )
+
         delta_start = 1e-6
-        delta = torch.linspace(delta_start, self.delta_end, timesteps, dtype=torch.float32)
+        delta = torch.linspace(
+            delta_start, self.delta_end, timesteps, dtype=torch.float32
+        )
         delta_cumsum = delta.cumsum(dim=0).clip(0, 1)
 
-        alphas = 1.0 - betas # [0.9999, ... ,0.98]
-        alphas_cumprod = torch.cumprod(alphas, dim=0) # 累积 [1, 1x2, 1x2x3]
-        alphas_cumsum = 1-alphas_cumprod ** 0.5 
-        betas2_cumsum = 1-alphas_cumprod
+        alphas = 1.0 - betas  # [0.9999, ... ,0.98]
+        alphas_cumprod = torch.cumprod(alphas, dim=0)  # 累积 [1, 1x2, 1x2x3]
+        alphas_cumsum = 1 - alphas_cumprod**0.5
+        betas2_cumsum = 1 - alphas_cumprod
 
-        alphas_cumsum_prev = F.pad(alphas_cumsum[:-1], (1, 0), value=1.) 
-        betas2_cumsum_prev = F.pad(betas2_cumsum[:-1], (1, 0), value=1.)
-        alphas = alphas_cumsum-alphas_cumsum_prev
+        alphas_cumsum_prev = F.pad(alphas_cumsum[:-1], (1, 0), value=1.0)
+        betas2_cumsum_prev = F.pad(betas2_cumsum[:-1], (1, 0), value=1.0)
+        alphas = alphas_cumsum - alphas_cumsum_prev
         alphas[0] = 0
-        betas2 = betas2_cumsum-betas2_cumsum_prev
+        betas2 = betas2_cumsum - betas2_cumsum_prev
         betas2[0] = 0
         # print(alphas_cumsum[-1])
         # print(delta_cumsum[-1])
         # raise
-        betas_cumsum = torch.sqrt(betas2_cumsum) 
+        betas_cumsum = torch.sqrt(betas2_cumsum)
 
-        posterior_variance = betas2*betas2_cumsum_prev/betas2_cumsum
+        posterior_variance = betas2 * betas2_cumsum_prev / betas2_cumsum
         posterior_variance[0] = 0
 
-        timesteps, = alphas.shape
+        (timesteps,) = alphas.shape
         self.num_timesteps = int(timesteps)
         self.loss_type = loss_type
 
@@ -705,26 +833,29 @@ class ResidualDiffusion(nn.Module):
         # import pdb
         # pdb.set_trace()
 
-        def register_buffer(name, val): return self.register_buffer(
-            name, val.to(torch.float32))
+        def register_buffer(name, val):
+            return self.register_buffer(name, val.to(torch.float32))
 
-        register_buffer('alphas', alphas)
-        register_buffer('alphas_cumsum', alphas_cumsum)
-        register_buffer('delta', delta)
-        register_buffer('delta_cumsum', delta_cumsum)
-        register_buffer('one_minus_alphas_cumsum', 1-alphas_cumsum)
-        register_buffer('betas2', betas2)
-        register_buffer('betas', torch.sqrt(betas2))
-        register_buffer('betas2_cumsum', betas2_cumsum)
-        register_buffer('betas_cumsum', betas_cumsum)
-        register_buffer('posterior_mean_coef1',
-                        betas2_cumsum_prev/betas2_cumsum)
-        register_buffer('posterior_mean_coef2', (betas2 *
-                        alphas_cumsum_prev-betas2_cumsum_prev*alphas)/betas2_cumsum)
-        register_buffer('posterior_mean_coef3', betas2/betas2_cumsum)
-        register_buffer('posterior_variance', posterior_variance)
-        register_buffer('posterior_log_variance_clipped',
-                        torch.log(posterior_variance.clamp(min=1e-20)))
+        register_buffer("alphas", alphas)
+        register_buffer("alphas_cumsum", alphas_cumsum)
+        register_buffer("delta", delta)
+        register_buffer("delta_cumsum", delta_cumsum)
+        register_buffer("one_minus_alphas_cumsum", 1 - alphas_cumsum)
+        register_buffer("betas2", betas2)
+        register_buffer("betas", torch.sqrt(betas2))
+        register_buffer("betas2_cumsum", betas2_cumsum)
+        register_buffer("betas_cumsum", betas_cumsum)
+        register_buffer("posterior_mean_coef1", betas2_cumsum_prev / betas2_cumsum)
+        register_buffer(
+            "posterior_mean_coef2",
+            (betas2 * alphas_cumsum_prev - betas2_cumsum_prev * alphas) / betas2_cumsum,
+        )
+        register_buffer("posterior_mean_coef3", betas2 / betas2_cumsum)
+        register_buffer("posterior_variance", posterior_variance)
+        register_buffer(
+            "posterior_log_variance_clipped",
+            torch.log(posterior_variance.clamp(min=1e-20)),
+        )
 
         self.posterior_mean_coef1[0] = 0
         self.posterior_mean_coef2[0] = 0
@@ -738,148 +869,174 @@ class ResidualDiffusion(nn.Module):
         beta_start = 0.0001
         beta_end = 0.02
         if beta_schedule == "linear":
-            betas = torch.linspace(
-                beta_start, beta_end, timesteps, dtype=torch.float32)
+            betas = torch.linspace(beta_start, beta_end, timesteps, dtype=torch.float32)
         elif beta_schedule == "scaled_linear":
             # this schedule is very specific to the latent diffusion model.
             betas = (
-                torch.linspace(beta_start**0.5, beta_end**0.5, timesteps, dtype=torch.float32) ** 2
+                torch.linspace(
+                    beta_start**0.5, beta_end**0.5, timesteps, dtype=torch.float32
+                )
+                ** 2
             )
         elif beta_schedule == "squaredcos_cap_v2":
             # Glide cosine schedule
             betas = betas_for_alpha_bar(timesteps)
         else:
-            raise NotImplementedError(f"{beta_schedule} does is not implemented for {self.__class__}")
-                
+            raise NotImplementedError(
+                f"{beta_schedule} does is not implemented for {self.__class__}"
+            )
+
         delta_start = 1e-6
-        delta = torch.linspace(delta_start, self.delta_end, timesteps, dtype=torch.float32)
+        delta = torch.linspace(
+            delta_start, self.delta_end, timesteps, dtype=torch.float32
+        )
         delta_cumsum = delta.cumsum(dim=0).clip(0, 1)
 
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
-        alphas_cumsum = 1-alphas_cumprod ** 0.5
-        betas2_cumsum = 1-alphas_cumprod
+        alphas_cumsum = 1 - alphas_cumprod**0.5
+        betas2_cumsum = 1 - alphas_cumprod
 
-        alphas_cumsum_prev = F.pad(alphas_cumsum[:-1], (1, 0), value=1.)
-        betas2_cumsum_prev = F.pad(betas2_cumsum[:-1], (1, 0), value=1.)
-        alphas = alphas_cumsum-alphas_cumsum_prev
+        alphas_cumsum_prev = F.pad(alphas_cumsum[:-1], (1, 0), value=1.0)
+        betas2_cumsum_prev = F.pad(betas2_cumsum[:-1], (1, 0), value=1.0)
+        alphas = alphas_cumsum - alphas_cumsum_prev
         alphas[0] = alphas[1]
-        betas2 = betas2_cumsum-betas2_cumsum_prev
+        betas2 = betas2_cumsum - betas2_cumsum_prev
         betas2[0] = betas2[1]
 
         betas_cumsum = torch.sqrt(betas2_cumsum)
-    
-        posterior_variance = betas2*betas2_cumsum_prev/betas2_cumsum
+
+        posterior_variance = betas2 * betas2_cumsum_prev / betas2_cumsum
         posterior_variance[0] = 0
 
-        timesteps, = alphas.shape
+        (timesteps,) = alphas.shape
         self.num_timesteps = int(timesteps)
 
         self.alphas = alphas
         self.alphas_cumsum = alphas_cumsum
         self.delta = delta
         self.delta_cumsum = delta_cumsum
-        self.one_minus_alphas_cumsum = 1-alphas_cumsum
+        self.one_minus_alphas_cumsum = 1 - alphas_cumsum
         self.betas2 = betas2
         self.betas = torch.sqrt(betas2)
         self.betas2_cumsum = betas2_cumsum
         self.betas_cumsum = betas_cumsum
-        self.posterior_mean_coef1 = betas2_cumsum_prev/betas2_cumsum
+        self.posterior_mean_coef1 = betas2_cumsum_prev / betas2_cumsum
         self.posterior_mean_coef2 = (
-            betas2 * alphas_cumsum_prev-betas2_cumsum_prev*alphas)/betas2_cumsum
-        self.posterior_mean_coef3 = betas2/betas2_cumsum
+            betas2 * alphas_cumsum_prev - betas2_cumsum_prev * alphas
+        ) / betas2_cumsum
+        self.posterior_mean_coef3 = betas2 / betas2_cumsum
         self.posterior_variance = posterior_variance
         self.posterior_log_variance_clipped = torch.log(
-            posterior_variance.clamp(min=1e-20))
+            posterior_variance.clamp(min=1e-20)
+        )
 
         self.posterior_mean_coef1[0] = 0
         self.posterior_mean_coef2[0] = 0
         self.posterior_mean_coef3[0] = 1
         self.one_minus_alphas_cumsum[-1] = 1e-6
 
-    def predict_noise_from_res(self, x_t, t, x_input, pred_res): 
+    def predict_noise_from_res(self, x_t, t, x_input, pred_res):
         ##  self.predict_noise_from_res(x, t, x_input, pred_res) # x_input: LQ, x: 0.1 * x_input + 0.1 * torch.randn_like(x_input)
         return (
-            (x_t - (1-extract(self.delta_cumsum,t,x_t.shape)) * x_input - (extract(self.alphas_cumsum, t, x_t.shape)-1)
-             * pred_res)/extract(self.betas_cumsum, t, x_t.shape)
-        )
+            x_t
+            - (1 - extract(self.delta_cumsum, t, x_t.shape)) * x_input
+            - (extract(self.alphas_cumsum, t, x_t.shape) - 1) * pred_res
+        ) / extract(self.betas_cumsum, t, x_t.shape)
 
-    def predict_start_from_xinput_noise(self, x_t, t, x_input, noise): 
+    def predict_start_from_xinput_noise(self, x_t, t, x_input, noise):
         return (
-            (x_t-extract(self.alphas_cumsum, t, x_t.shape)*x_input -
-             extract(self.betas_cumsum, t, x_t.shape) * noise)/extract(self.one_minus_alphas_cumsum, t, x_t.shape)
-        )
+            x_t
+            - extract(self.alphas_cumsum, t, x_t.shape) * x_input
+            - extract(self.betas_cumsum, t, x_t.shape) * noise
+        ) / extract(self.one_minus_alphas_cumsum, t, x_t.shape)
 
-    def predict_start_from_res_noise(self, x_t, t, x_res, noise): 
+    def predict_start_from_res_noise(self, x_t, t, x_res, noise):
         return (
-            x_t-extract(self.alphas_cumsum, t, x_t.shape) * x_res -
-            extract(self.betas_cumsum, t, x_t.shape) * noise
+            x_t
+            - extract(self.alphas_cumsum, t, x_t.shape) * x_res
+            - extract(self.betas_cumsum, t, x_t.shape) * noise
         )
 
-    def q_posterior_from_res_noise(self, x_res, noise, x_t, t): 
-        return (x_t-extract(self.alphas, t, x_t.shape) * x_res -
-                (extract(self.betas2, t, x_t.shape)/extract(self.betas_cumsum, t, x_t.shape)) * noise)
+    def q_posterior_from_res_noise(self, x_res, noise, x_t, t):
+        return (
+            x_t
+            - extract(self.alphas, t, x_t.shape) * x_res
+            - (
+                extract(self.betas2, t, x_t.shape)
+                / extract(self.betas_cumsum, t, x_t.shape)
+            )
+            * noise
+        )
 
-    def q_posterior(self, pred_res, x_start, x_t, t): 
+    def q_posterior(self, pred_res, x_start, x_t, t):
         posterior_mean = (
-            extract(self.posterior_mean_coef1, t, x_t.shape) * x_t +
-            extract(self.posterior_mean_coef2, t, x_t.shape) * pred_res +
-            extract(self.posterior_mean_coef3, t, x_t.shape) * x_start
+            extract(self.posterior_mean_coef1, t, x_t.shape) * x_t
+            + extract(self.posterior_mean_coef2, t, x_t.shape) * pred_res
+            + extract(self.posterior_mean_coef3, t, x_t.shape) * x_start
         )
         posterior_variance = extract(self.posterior_variance, t, x_t.shape)
         posterior_log_variance_clipped = extract(
-            self.posterior_log_variance_clipped, t, x_t.shape)
+            self.posterior_log_variance_clipped, t, x_t.shape
+        )
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x_input, x, t, task=None, clip_denoised=True): 
-        if not self.condition: # x_input: LQ, x: img = 0.1 * x_input + 0.1 * torch.randn_like(x_input)
+    def model_predictions(self, x_input, x, t, task=None, clip_denoised=True):
+        if (
+            not self.condition
+        ):  # x_input: LQ, x: img = 0.1 * x_input + 0.1 * torch.randn_like(x_input)
             x_in = x
         else:
             x_in = torch.cat((x, x_input), dim=1)
-        model_output = self.model(x_in,
-                                  [self.alphas_cumsum[t]*self.num_timesteps,
-                                      self.betas_cumsum[t]*self.num_timesteps])
-        maybe_clip = partial(torch.clamp, min=-1.,
-                             max=1.) if clip_denoised else identity
+        model_output = self.model(
+            x_in,
+            [
+                self.alphas_cumsum[t] * self.num_timesteps,
+                self.betas_cumsum[t] * self.num_timesteps,
+            ],
+        )
+        maybe_clip = (
+            partial(torch.clamp, min=-1.0, max=1.0) if clip_denoised else identity
+        )
 
-        if self.objective == 'pred_res_noise':
+        if self.objective == "pred_res_noise":
             if self.test_res_or_noise == "res_noise":
                 pred_res = model_output[0]
                 pred_noise = model_output[1]
                 pred_res = maybe_clip(pred_res)
-                x_start = self.predict_start_from_res_noise(
-                    x, t, pred_res, pred_noise)
+                x_start = self.predict_start_from_res_noise(x, t, pred_res, pred_noise)
                 x_start = maybe_clip(x_start)
             elif self.test_res_or_noise == "res":
                 pred_res = model_output[0]
                 pred_res = maybe_clip(pred_res)
-                pred_noise = self.predict_noise_from_res(
-                    x, t, x_input, pred_res)
+                pred_noise = self.predict_noise_from_res(x, t, x_input, pred_res)
                 x_start = x_input - pred_res
                 x_start = maybe_clip(x_start)
             elif self.test_res_or_noise == "noise":
                 pred_noise = model_output[1]
                 x_start = self.predict_start_from_xinput_noise(
-                    x, t, x_input, pred_noise)
+                    x, t, x_input, pred_noise
+                )
                 x_start = maybe_clip(x_start)
                 pred_res = x_input - x_start
                 pred_res = maybe_clip(pred_res)
-        elif self.objective == 'pred_x0_noise':
-            pred_res = x_input-model_output[0]
+        elif self.objective == "pred_x0_noise":
+            pred_res = x_input - model_output[0]
             pred_noise = model_output[1]
             pred_res = maybe_clip(pred_res)
             x_start = maybe_clip(model_output[0])
         elif self.objective == "pred_noise":
             pred_noise = model_output[0]
-            x_start = self.predict_start_from_xinput_noise(
-                x, t, x_input, pred_noise)
+            x_start = self.predict_start_from_xinput_noise(x, t, x_input, pred_noise)
             x_start = maybe_clip(x_start)
             pred_res = x_input - x_start
             pred_res = maybe_clip(pred_res)
         elif self.objective == "pred_res":
             pred_res = model_output[0]
             pred_res = maybe_clip(pred_res)
-            pred_noise = self.predict_noise_from_res(x, t, x_input, pred_res) # x_input: LQ, x: 0.1 * x_input + 0.1 * torch.randn_like(x_input)
+            pred_noise = self.predict_noise_from_res(
+                x, t, x_input, pred_res
+            )  # x_input: LQ, x: 0.1 * x_input + 0.1 * torch.randn_like(x_input)
             x_start = x_input - pred_res
             x_start = maybe_clip(x_start)
 
@@ -891,16 +1048,18 @@ class ResidualDiffusion(nn.Module):
         x_start = preds.pred_x_start
 
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(
-            pred_res=pred_res, x_start=x_start, x_t=x, t=t)
+            pred_res=pred_res, x_start=x_start, x_t=x, t=t
+        )
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.no_grad()
     def p_sample(self, x_input, x, t: int):
         b, *_, device = *x.shape, x.device
-        batched_times = torch.full(
-            (x.shape[0],), t, device=x.device, dtype=torch.long)
-        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x_input, x=x, t=batched_times)
-        noise = torch.randn_like(x) if t > 0 else 0.  # no noise if t == 0
+        batched_times = torch.full((x.shape[0],), t, device=x.device, dtype=torch.long)
+        model_mean, _, model_log_variance, x_start = self.p_mean_variance(
+            x_input, x=x, t=batched_times
+        )
+        noise = torch.randn_like(x) if t > 0 else 0.0  # no noise if t == 0
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
 
@@ -911,8 +1070,9 @@ class ResidualDiffusion(nn.Module):
         batch, device = shape[0], self.betas.device
 
         if self.condition:
-            img = x_input+math.sqrt(self.sum_scale) * \
-                torch.randn(shape, device=device)
+            img = x_input + math.sqrt(self.sum_scale) * torch.randn(
+                shape, device=device
+            )
             input_add_noise = img
         else:
             img = torch.randn(shape, device=device)
@@ -922,7 +1082,11 @@ class ResidualDiffusion(nn.Module):
         if not last:
             img_list = []
 
-        for t in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
+        for t in tqdm(
+            reversed(range(0, self.num_timesteps)),
+            desc="sampling loop time step",
+            total=self.num_timesteps,
+        ):
             img, x_start = self.p_sample(x_input, img, t)
 
             if not last:
@@ -930,7 +1094,7 @@ class ResidualDiffusion(nn.Module):
 
         if self.condition:
             if not last:
-                img_list = [input_add_noise]+img_list
+                img_list = [input_add_noise] + img_list
             else:
                 img_list = [input_add_noise, img]
             return unnormalize_to_zero_to_one(img_list)
@@ -945,19 +1109,31 @@ class ResidualDiffusion(nn.Module):
     def ddim_sample(self, x_input, shape, last=True, task=None):
         x_input = x_input[0]
 
-        batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[
-            0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
+        batch, device, total_timesteps, sampling_timesteps, eta, objective = (
+            shape[0],
+            self.betas.device,
+            self.num_timesteps,
+            self.sampling_timesteps,
+            self.ddim_sampling_eta,
+            self.objective,
+        )
 
         # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
-        times = torch.linspace(-1, total_timesteps - 1,
-                               steps=sampling_timesteps + 1)#[:num] # [-1, 332, 665, 999]
+        times = torch.linspace(
+            -1, total_timesteps - 1, steps=sampling_timesteps + 1
+        )  # [:num] # [-1, 332, 665, 999]
 
-        times = list(reversed(times.int().tolist())) # [999, 665, 332, -1]
+        times = list(reversed(times.int().tolist()))  # [999, 665, 332, -1]
         # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
-        time_pairs = list(zip(times[:-1], times[1:])) # [(999, 665), (665, 332), (332, -1)]
-   
+        time_pairs = list(
+            zip(times[:-1], times[1:])
+        )  # [(999, 665), (665, 332), (332, -1)]
+
         if self.condition:
-            img = (1-self.delta_cumsum[-1]) * x_input + math.sqrt(self.sum_scale) * torch.randn(shape, device=device) # self.delta_cumsum: [1e-6, 3.80e-6, 0.003, ..., 0.9005]; img = 0.1 * x_input + 0.1 * torch.randn
+            img = (
+                (1 - self.delta_cumsum[-1]) * x_input
+                + math.sqrt(self.sum_scale) * torch.randn(shape, device=device)
+            )  # self.delta_cumsum: [1e-6, 3.80e-6, 0.003, ..., 0.9005]; img = 0.1 * x_input + 0.1 * torch.randn
             # img = (1-self.delta_cumsum[-1]) * x_input + self.betas_cumsum[-1] * torch.randn(shape, device=device)
             input_add_noise = img
         else:
@@ -966,17 +1142,20 @@ class ResidualDiffusion(nn.Module):
         x_start = None
         type = "use_pred_noise"
         # type = "use_x_start"
-        last=False
+        last = False
 
         if not last:
             img_list = []
 
-        # import pdb 
+        # import pdb
         # pdb.set_trace()
 
-        for time, time_next in tqdm(time_pairs, desc='sampling loop time step'): # (999, 665), (665, 332), (332, -1)
+        for time, time_next in tqdm(
+            time_pairs, desc="sampling loop time step"
+        ):  # (999, 665), (665, 332), (332, -1)
             time_cond = torch.full(
-                (batch,), time, device=device, dtype=torch.long)  # tensor([999]) 1x1
+                (batch,), time, device=device, dtype=torch.long
+            )  # tensor([999]) 1x1
             preds = self.model_predictions(x_input, img, time_cond, task)
 
             pred_res = preds.pred_res
@@ -991,19 +1170,20 @@ class ResidualDiffusion(nn.Module):
 
             alpha_cumsum = self.alphas_cumsum[time]
             alpha_cumsum_next = self.alphas_cumsum[time_next]
-            alpha = alpha_cumsum-alpha_cumsum_next
+            alpha = alpha_cumsum - alpha_cumsum_next
             delta_cumsum = self.delta_cumsum[time]
             delta_cumsum_next = self.delta_cumsum[time_next]
-            delta = delta_cumsum-delta_cumsum_next
+            delta = delta_cumsum - delta_cumsum_next
             betas2_cumsum = self.betas2_cumsum[time]
             betas2_cumsum_next = self.betas2_cumsum[time_next]
-            betas2 = betas2_cumsum-betas2_cumsum_next
+            betas2 = betas2_cumsum - betas2_cumsum_next
             betas = betas2.sqrt()
             betas_cumsum = self.betas_cumsum[time]
             betas_cumsum_next = self.betas_cumsum[time_next]
-            sigma2 = eta * (betas2*betas2_cumsum_next/betas2_cumsum)
+            sigma2 = eta * (betas2 * betas2_cumsum_next / betas2_cumsum)
             sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum = (
-                betas2_cumsum_next-sigma2).sqrt()/betas_cumsum
+                betas2_cumsum_next - sigma2
+            ).sqrt() / betas_cumsum
             q = betas2_cumsum_next / betas2_cumsum
 
             if eta == 0:
@@ -1011,31 +1191,40 @@ class ResidualDiffusion(nn.Module):
             else:
                 noise = torch.randn_like(img)
             if type == "use_pred_noise":
-                img = img - alpha*pred_res + delta*x_input + sigma2.sqrt()*noise
+                img = img - alpha * pred_res + delta * x_input + sigma2.sqrt() * noise
             elif type == "use_x_start":
                 # img = sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum*img + \
                 #     (1-sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*x_start + \
                 #     (alpha_cumsum_next-alpha_cumsum*sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*pred_res + \
                 #     (delta_cumsum*sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum-delta_cumsum_next)*x_input + \
                 #     sigma2.sqrt()*noise
-                img = q*img + \
-                    (1-q)*x_start + \
-                    (alpha_cumsum_next-alpha_cumsum*q)*pred_res + \
-                    (delta_cumsum*q-delta_cumsum_next)*x_input + \
-                    sigma2.sqrt()*noise
+                img = (
+                    q * img
+                    + (1 - q) * x_start
+                    + (alpha_cumsum_next - alpha_cumsum * q) * pred_res
+                    + (delta_cumsum * q - delta_cumsum_next) * x_input
+                    + sigma2.sqrt() * noise
+                )
             elif type == "special_eta_0":
-                img = img - alpha*pred_res - \
-                    (betas_cumsum-betas_cumsum_next)*pred_noise
+                img = (
+                    img
+                    - alpha * pred_res
+                    - (betas_cumsum - betas_cumsum_next) * pred_noise
+                )
             elif type == "special_eta_1":
-                img = img - alpha*pred_res - betas2/betas_cumsum*pred_noise + \
-                    betas*betas2_cumsum_next.sqrt()/betas_cumsum*noise
-                    
+                img = (
+                    img
+                    - alpha * pred_res
+                    - betas2 / betas_cumsum * pred_noise
+                    + betas * betas2_cumsum_next.sqrt() / betas_cumsum * noise
+                )
+
             if not last:
                 img_list.append(img)
-    
+
         if self.condition:
             if not last:
-                img_list = [input_add_noise]+img_list
+                img_list = [input_add_noise] + img_list
                 # img_list = img_list
             else:
                 img_list = [input_add_noise, img]
@@ -1050,7 +1239,9 @@ class ResidualDiffusion(nn.Module):
     @torch.no_grad()
     def sample(self, x_input=0, batch_size=16, last=True, task=None):
         image_size, channels = self.image_size, self.channels
-        sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample  # se;f.ddim_sample
+        sample_fn = (
+            self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
+        )  # se;f.ddim_sample
         if self.condition:
             x_input = 2 * x_input - 1
             x_input = x_input.unsqueeze(0)
@@ -1065,34 +1256,34 @@ class ResidualDiffusion(nn.Module):
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         return (
-            x_start+extract(self.alphas_cumsum, t, x_start.shape) * x_res +
-            extract(self.betas_cumsum, t, x_start.shape) * noise -
-            extract(self.delta_cumsum, t, x_start.shape) * condition
+            x_start
+            + extract(self.alphas_cumsum, t, x_start.shape) * x_res
+            + extract(self.betas_cumsum, t, x_start.shape) * noise
+            - extract(self.delta_cumsum, t, x_start.shape) * condition
         )
 
     @property
-    def loss_fn(self, loss_type='l1'):
-        if loss_type == 'l1':
+    def loss_fn(self, loss_type="l1"):
+        if loss_type == "l1":
             return F.l1_loss
-        elif loss_type == 'l2':
+        elif loss_type == "l2":
             return F.mse_loss
         else:
-            raise ValueError(f'invalid loss type {loss_type}')
+            raise ValueError(f"invalid loss type {loss_type}")
 
     def p_losses(self, imgs, t, noise=None):
         if isinstance(imgs, list):  # Condition
             x_input = 2 * imgs[1] - 1
-            x_start = 2 * imgs[0] - 1  #gt:imgs[0], cond:imgs[1]
+            x_start = 2 * imgs[0] - 1  # gt:imgs[0], cond:imgs[1]
             task = imgs[2][0]
 
-
         noise = default(noise, lambda: torch.randn_like(x_start))
-        x_res = x_input - x_start # cond-GT, x_input=LQ, x_start=GT
+        x_res = x_input - x_start  # cond-GT, x_input=LQ, x_start=GT
 
         b, c, h, w = x_start.shape
 
         # noise sample
-        x = self.q_sample(x_start, x_res, x_input, t, noise=noise) # 
+        x = self.q_sample(x_start, x_res, x_input, t, noise=noise)  #
 
         # predict and take gradient step
         if not self.condition:
@@ -1100,22 +1291,26 @@ class ResidualDiffusion(nn.Module):
         else:
             x_in = torch.cat((x, x_input), dim=1)
 
-        model_out = self.model(x_in,
-                               [self.alphas_cumsum[t]*self.num_timesteps,
-                                self.betas_cumsum[t]*self.num_timesteps])
+        model_out = self.model(
+            x_in,
+            [
+                self.alphas_cumsum[t] * self.num_timesteps,
+                self.betas_cumsum[t] * self.num_timesteps,
+            ],
+        )
 
         target = []
-        if self.objective == 'pred_res_noise':
+        if self.objective == "pred_res_noise":
             target.append(x_res)
             target.append(noise)
 
             pred_res = model_out[0]
             pred_noise = model_out[1]
-        elif self.objective == 'pred_x0_noise':
+        elif self.objective == "pred_x0_noise":
             target.append(x_start)
             target.append(noise)
 
-            pred_res = x_input-model_out[0]
+            pred_res = x_input - model_out[0]
             pred_noise = model_out[1]
         elif self.objective == "pred_noise":
             target.append(noise)
@@ -1124,38 +1319,55 @@ class ResidualDiffusion(nn.Module):
 
         elif self.objective == "pred_res":
             target.append(x_res)
-        
+
             pred_res = model_out[0]
 
         else:
-            raise ValueError(f'unknown objective {self.objective}')
+            raise ValueError(f"unknown objective {self.objective}")
 
         u_loss = False
         if u_loss:
             x_u = self.q_posterior_from_res_noise(pred_res, pred_noise, x, t)
             u_gt = self.q_posterior_from_res_noise(x_res, noise, x, t)
-            loss = 10000*self.loss_fn(x_u, u_gt, reduction='none')
+            loss = 10000 * self.loss_fn(x_u, u_gt, reduction="none")
             return [loss]
         else:
             loss_list = []
             for i in range(len(model_out)):
-                loss = self.loss_fn(model_out[i], target[i], reduction='none')
-                loss = reduce(loss, 'b ... -> b (...)', 'mean').mean()
+                loss = self.loss_fn(model_out[i], target[i], reduction="none")
+                loss = reduce(loss, "b ... -> b (...)", "mean").mean()
                 loss_list.append(loss)
             return loss_list
 
     def forward(self, img, *args, **kwargs):
         if isinstance(img, list):
-            b, c, h, w, device, img_size, = * \
-                img[0].shape, img[0].device, self.image_size
+            (
+                b,
+                c,
+                h,
+                w,
+                device,
+                img_size,
+            ) = *img[0].shape, img[0].device, self.image_size
         else:
-            b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
-        t = torch.randint(0, self.num_timesteps, (b,), device=device).long() # b个0-timesteps int []
+            (
+                b,
+                c,
+                h,
+                w,
+                device,
+                img_size,
+            ) = *img.shape, img.device, self.image_size
+        t = torch.randint(
+            0, self.num_timesteps, (b,), device=device
+        ).long()  # b个0-timesteps int []
 
         return self.p_losses(img, t, *args, **kwargs)
+
     # def forward(self, x_input_sample, batches, last, file_):
     #     # profile
     #     return self.sample(x_input_sample, batch_size=batches, last=last, task=file_)
+
 
 class Trainer(object):
     def __init__(
@@ -1175,28 +1387,30 @@ class Trainer(object):
         save_and_sample_every=1000,
         num_unet=1,
         num_samples=25,
-        results_folder='./results/sample',
+        results_folder="./results/sample",
         amp=False,
         fp16=False,
         split_batches=True,
         convert_image_to=None,
         condition=False,
         sub_dir=False,
+        version="v1",
     ):
         super().__init__()
 
         self.accelerator = Accelerator(
-            split_batches=split_batches,
-            mixed_precision='fp16' if fp16 else 'no'
+            split_batches=split_batches, mixed_precision="fp16" if fp16 else "no"
         )
         self.sub_dir = sub_dir
         self.accelerator.native_amp = amp
         self.num_unet = num_unet
         self.model = diffusion_model
         self.results_folder = results_folder
+        self.version = version
 
-        assert has_int_squareroot(
-            num_samples), 'number of samples must have an integer square root'
+        assert has_int_squareroot(num_samples), (
+            "number of samples must have an integer square root"
+        )
         self.num_samples = num_samples
         self.save_and_sample_every = save_and_sample_every
 
@@ -1206,20 +1420,48 @@ class Trainer(object):
         self.train_num_steps = train_num_steps
         self.image_size = diffusion_model.image_size
         self.condition = condition
-        self.ema = EMA(diffusion_model, beta=ema_decay,
-              update_every=ema_update_every)
+        self.ema = EMA(diffusion_model, beta=ema_decay, update_every=ema_update_every)
 
         if self.condition:
             if opts.phase == "train":
-                if 'combined' or 'all' in results_folder:
-                    self.dl = cycle(self.accelerator.prepare(DataLoader(dataset, batch_size=self.batch_size, shuffle=True, pin_memory=True, num_workers=8)))
-                elif 'paired' in results_folder:
-                    self.dl_light = cycle(self.accelerator.prepare(DataLoader(dataset[0], batch_size=32, shuffle=True, pin_memory=True, num_workers=8)))
-                    self.dl_night = cycle(self.accelerator.prepare(DataLoader(dataset[1], batch_size=32, shuffle=True, pin_memory=True, num_workers=8)))
-                    
+                if "combined" or "all" in results_folder:
+                    self.dl = cycle(
+                        self.accelerator.prepare(
+                            DataLoader(
+                                dataset,
+                                batch_size=self.batch_size,
+                                shuffle=True,
+                                pin_memory=True,
+                                num_workers=8,
+                            )
+                        )
+                    )
+                elif "paired" in results_folder:
+                    self.dl_light = cycle(
+                        self.accelerator.prepare(
+                            DataLoader(
+                                dataset[0],
+                                batch_size=32,
+                                shuffle=True,
+                                pin_memory=True,
+                                num_workers=8,
+                            )
+                        )
+                    )
+                    self.dl_night = cycle(
+                        self.accelerator.prepare(
+                            DataLoader(
+                                dataset[1],
+                                batch_size=32,
+                                shuffle=True,
+                                pin_memory=True,
+                                num_workers=8,
+                            )
+                        )
+                    )
+
             else:
                 self.sample_dataset = dataset
-                
 
         # optimizer
         self.opt0 = Adam(diffusion_model.parameters(), lr=train_lr, betas=adam_betas)
@@ -1234,7 +1476,7 @@ class Trainer(object):
 
         # prepare model, dataloader, optimizer with accelerator
         self.model, self.opt0 = self.accelerator.prepare(self.model, self.opt0)
-        
+
         device = self.accelerator.device
         self.device = device
 
@@ -1242,32 +1484,34 @@ class Trainer(object):
         if not self.accelerator.is_local_main_process:
             return
         data = {
-            'step': self.step,
-            'model': self.accelerator.get_state_dict(self.model),
-            'opt0': self.opt0.state_dict(),
-            'ema': self.ema.state_dict(),
-            'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None
+            "step": self.step,
+            "model": self.accelerator.get_state_dict(self.model),
+            "opt0": self.opt0.state_dict(),
+            "ema": self.ema.state_dict(),
+            "scaler": self.accelerator.scaler.state_dict()
+            if exists(self.accelerator.scaler)
+            else None,
         }
-        torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
+        torch.save(data, str(self.results_folder / f"model-{milestone}.pt"))
 
     def load(self, milestone):
-        path = Path(self.results_folder) / f'model-{milestone}.pt'
+        path = Path(self.results_folder) / f"model-{milestone}.pt"
         if path.exists():
             data = torch.load(str(path), map_location=self.device)
             self.model = self.accelerator.unwrap_model(self.model)
-  
-            self.model.load_state_dict(data['model'])
-            self.step = data['step']
-            
-            self.opt0.load_state_dict(data['opt0'])
-            self.opt0.param_groups[0]['capturable'] = True
 
-            self.ema.load_state_dict(data['ema'])
+            self.model.load_state_dict(data["model"])
+            self.step = data["step"]
 
-            if exists(self.accelerator.scaler) and exists(data['scaler']):
-                self.accelerator.scaler.load_state_dict(data['scaler'])
+            self.opt0.load_state_dict(data["opt0"])
+            self.opt0.param_groups[0]["capturable"] = True
 
-            print("load model - "+str(path))
+            self.ema.load_state_dict(data["ema"])
+
+            if exists(self.accelerator.scaler) and exists(data["scaler"]):
+                self.accelerator.scaler.load_state_dict(data["scaler"])
+
+            print("load model - " + str(path))
 
         # self.ema.to(self.device)
 
@@ -1275,25 +1519,31 @@ class Trainer(object):
         accelerator = self.accelerator
         results_folder = self.results_folder
 
-        with tqdm(initial=self.step, total=self.train_num_steps, disable=not accelerator.is_main_process) as pbar:
-
+        with tqdm(
+            initial=self.step,
+            total=self.train_num_steps,
+            disable=not accelerator.is_main_process,
+        ) as pbar:
             while self.step < self.train_num_steps:
-
                 total_loss = [0]
-                
+
                 for _ in range(self.gradient_accumulate_every):
                     if self.condition:
-                        if 'combined' or 'all' in str(results_folder):
-                            data = next(self.dl)                
-                        elif 'paired' in str(results_folder):
+                        if "combined" or "all" in str(results_folder):
+                            data = next(self.dl)
+                        elif "paired" in str(results_folder):
                             batch1 = next(self.dl_light)
                             batch2 = next(self.dl_night)
                             data = {}
                             for k, v in batch1.items():
-                                if 'path' in k:
-                                    data[k] = batch1[k] + batch2[k] ## data['A_paths'] = [b1_path,b2_path]
+                                if "path" in k:
+                                    data[k] = (
+                                        batch1[k] + batch2[k]
+                                    )  ## data['A_paths'] = [b1_path,b2_path]
                                 else:
-                                    data[k] = torch.cat([batch1[k], batch2[k]], dim=0) # data['adap'] = torch.cat([b1_adap, b2_adap], dim=0)
+                                    data[k] = torch.cat(
+                                        [batch1[k], batch2[k]], dim=0
+                                    )  # data['adap'] = torch.cat([b1_adap, b2_adap], dim=0)
                         gt = data["gt"].to(self.device)
                         cond_input = data["adap"].to(self.device)
 
@@ -1327,24 +1577,33 @@ class Trainer(object):
                     self.ema.to(self.device)
                     self.ema.update()
 
-                    if self.step != 0 and self.step % (self.save_and_sample_every*10) == 0:
+                    if (
+                        self.step != 0
+                        and self.step % (self.save_and_sample_every * 10) == 0
+                    ):
                         milestone = self.step // self.save_and_sample_every
                         self.save(milestone)
-                        
-                pbar.set_description(f'loss_unet0: {total_loss[0]:.4f}')
+
+                pbar.set_description(f"loss_unet0: {total_loss[0]:.4f}")
                 pbar.update(1)
 
-        accelerator.print('training complete')
-    
-    def test(self, sample=False, last=True, FID=False, crop_phase=None, crop_size=None, crop_stride=None):
+        accelerator.print("training complete")
+
+    def test(
+        self,
+        sample=False,
+        last=True,
+        FID=False,
+        crop_phase=None,
+        crop_size=None,
+        crop_stride=None,
+    ):
         self.ema.ema_model.init()
         self.ema.to(self.device)
         print("test start")
         if self.condition:
             self.ema.ema_model.eval()
-            loader = DataLoader(
-                dataset=self.sample_dataset,
-                batch_size=1)
+            loader = DataLoader(dataset=self.sample_dataset, batch_size=1)
             i = 0
             cnt = 0
             # opt_metric = {
@@ -1366,47 +1625,66 @@ class Trainer(object):
             tran = transforms.ToTensor()
             for items in loader:
                 if self.condition:
-                    file_ = items["B_paths"][0] 
-                    file_name = file_.split('/')[-3]
+                    file_ = items["B_paths"][0]
+                    file_name = file_.split("/")[-3]
                 else:
-                    file_name = f'{i}.png'
+                    file_name = f"{i}.png"
 
                 i += 1
-                
+
                 start_time = time.time()
-                
+
                 # if crop_size is not None:
                 #     patches, positions = self.split_image(data["adap"], crop_size, crop_stride)
                 with torch.no_grad():
                     batches = self.num_samples
-                    
+
                     data = items
                     x_input_sample = data["adap"].to(self.device)
-                    _, _, h, w = x_input_sample.shape 
+                    _, _, h, w = x_input_sample.shape
                     # gt = data["gt"].to(self.device)
                     # import pdb; pdb.set_trace()
-                    if crop_phase == 'weight' and crop_size is not None:
+                    if crop_phase == "weight" and crop_size is not None:
                         if (h * w) > crop_size**2:
-                            patches, positions = self.split_image(x_input_sample, crop_size, crop_stride)
+                            patches, positions = self.split_image(
+                                x_input_sample, crop_size, crop_stride
+                            )
                             processed_patches = []
                             for p in patches:
-                                p_images_list = list(self.ema.ema_model.sample(
-                                p, batch_size=batches, last=last, task=file_))
+                                p_images_list = list(
+                                    self.ema.ema_model.sample(
+                                        p, batch_size=batches, last=last, task=file_
+                                    )
+                                )
                                 p_images_list = [p_images_list[-1]]
                                 p_images = torch.cat(p_images_list, dim=0)
                                 processed_patches.append(p_images)
-                            
-                            all_images = self.merge_patches_with_weights(processed_patches, positions, x_input_sample.shape, crop_size, crop_stride)
+
+                            all_images = self.merge_patches_with_weights(
+                                processed_patches,
+                                positions,
+                                x_input_sample.shape,
+                                crop_size,
+                                crop_stride,
+                            )
                         else:
-                            all_images_list = list(self.ema.ema_model.sample(
-                            x_input_sample, batch_size=batches, last=last, task=file_))
+                            all_images_list = list(
+                                self.ema.ema_model.sample(
+                                    x_input_sample,
+                                    batch_size=batches,
+                                    last=last,
+                                    task=file_,
+                                )
+                            )
                             all_images_list = [all_images_list[-1]]
                             all_images = torch.cat(all_images_list, dim=0)
 
-                    elif crop_phase == 'im2overlap' and crop_size is not None:
+                    elif crop_phase == "im2overlap" and crop_size is not None:
                         if (h * w) > crop_size**2:
-                            patches, idx, size = self.img2patch(x_input_sample, scale=1, crop_size=crop_size)
-                
+                            patches, idx, size = self.img2patch(
+                                x_input_sample, scale=1, crop_size=crop_size
+                            )
+
                             with torch.no_grad():
                                 n = len(patches)
                                 outs = []
@@ -1416,40 +1694,61 @@ class Trainer(object):
                                     j = i + m
                                     if j >= n:
                                         j = n
-                                    pred = output = self.ema.ema_model.sample(patches[i:j], batch_size=batches, last=last, task=file_)
+                                    pred = output = self.ema.ema_model.sample(
+                                        patches[i:j],
+                                        batch_size=batches,
+                                        last=last,
+                                        task=file_,
+                                    )
                                     if isinstance(pred, list):
                                         pred = pred[-1]
                                     outs.append(pred.detach())
                                     i = j
                                 output = torch.cat(outs, dim=0)
 
-                            all_images = self.patch2img(output, idx, size, scale=1, crop_size=crop_size)
+                            all_images = self.patch2img(
+                                output, idx, size, scale=1, crop_size=crop_size
+                            )
                         else:
-                            all_images_list = list(self.ema.ema_model.sample(
-                            x_input_sample, batch_size=batches, last=last, task=file_))
+                            all_images_list = list(
+                                self.ema.ema_model.sample(
+                                    x_input_sample,
+                                    batch_size=batches,
+                                    last=last,
+                                    task=file_,
+                                )
+                            )
                             all_images_list = [all_images_list[-1]]
                             all_images = torch.cat(all_images_list, dim=0)
-                            
+
                     else:
-                        all_images_list = list(self.ema.ema_model.sample(
-                            x_input_sample, batch_size=batches, last=last, task=file_))
+                        all_images_list = list(
+                            self.ema.ema_model.sample(
+                                x_input_sample,
+                                batch_size=batches,
+                                last=last,
+                                task=file_,
+                            )
+                        )
                         all_images_list = [all_images_list[-1]]
                         all_images = torch.cat(all_images_list, dim=0)
-                        
-                print(time.time()-start_time)         
- 
+
+                print(time.time() - start_time)
+
                 if last:
                     nrow = int(math.sqrt(self.num_samples))
                 else:
                     nrow = all_images.shape[0]
                 save_path = str(self.results_folder / file_name)
                 os.makedirs(save_path, exist_ok=True)
-                full_path = os.path.join(save_path, file_.split('/')[-1]).replace('_fake_B','')
+                full_path = os.path.join(save_path, file_.split("/")[-1]).replace(
+                    "_fake_B", ""
+                )
                 utils.save_image(all_images, full_path, nrow=nrow)
-                print("test-save "+full_path)
-                
-            #calculate the metric
-            
+                print("test-save " + full_path)
+
+            # calculate the metric
+
             #     sr_img = tensor2img(all_images, rgb2bgr=True)
             #     gt_img = tensor2img(gt, rgb2bgr=True)
             #     opt_metric_ = {
@@ -1467,7 +1766,7 @@ class Trainer(object):
             #     for name, opt_ in opt_metric_.items():
             #         metric_type = opt_.pop('type')
             #         self.metric_results[name] += getattr(metric_module, metric_type)(sr_img, gt_img, **opt_)
-               
+
             #     cnt += 1
 
             # current_metric = {}
@@ -1476,7 +1775,7 @@ class Trainer(object):
             #     current_metric[metric] = self.metric_results[metric]
             # print(current_metric['psnr'])
             # print(current_metric['ssim'])
-        
+
         print("test end")
 
     def set_results_folder(self, path):
@@ -1497,9 +1796,11 @@ class Trainer(object):
                 patches.append(patch)
                 positions.append((i, j))
         return patches, positions
-    
+
     def create_weight_map(self, patch_size, overlap):
-        weight_map = torch.ones((patch_size, patch_size), dtype=torch.float32).to(self.device)
+        weight_map = torch.ones((patch_size, patch_size), dtype=torch.float32).to(
+            self.device
+        )
         ramp = torch.linspace(0, 1, overlap).to(self.device)
         weight_map[:overlap, :] *= ramp[:, None]
         weight_map[-overlap:, :] *= ramp.flip(0)[:, None]
@@ -1507,28 +1808,37 @@ class Trainer(object):
         weight_map[:, -overlap:] *= ramp.flip(0)[None, :]
         return weight_map
 
-    def merge_patches_with_weights(self, patches, positions, image_size, patch_size, overlap):
+    def merge_patches_with_weights(
+        self, patches, positions, image_size, patch_size, overlap
+    ):
         b, c, h, w = image_size
         result = torch.zeros((b, c, h, w), dtype=torch.float32).to(self.device)
         weight = torch.zeros((b, c, h, w), dtype=torch.float32).to(self.device)
-        weight_map = self.create_weight_map(patch_size, overlap).unsqueeze(0).unsqueeze(0)
+        weight_map = (
+            self.create_weight_map(patch_size, overlap).unsqueeze(0).unsqueeze(0)
+        )
 
         for patch, (i, j) in zip(patches, positions):
             patch_h, patch_w = patch.shape[2:]
             weighted_patch = patch * weight_map[:, :, :patch_h, :patch_w]
-            result[:, :, j:j+patch_h, i:i+patch_w] += weighted_patch
-            weight[:, :, j:j+patch_h, i:i+patch_w] += weight_map[:, :, :patch_h, :patch_w]
-    
+            result[:, :, j : j + patch_h, i : i + patch_w] += weighted_patch
+            weight[:, :, j : j + patch_h, i : i + patch_w] += weight_map[
+                :, :, :patch_h, :patch_w
+            ]
+
         result /= weight
         return result
 
-    def img2patch(self, lq, scale=1, crop_size=1024, overlap=512): ## 128-200
-        b, c, hl, wl = lq.size()    
+    def img2patch(self, lq, scale=1, crop_size=1024, overlap=512):  ## 128-200
+        b, c, hl, wl = lq.size()
         h, w = hl * scale, wl * scale
         sr_size = (b, c, h, w)
         assert b == 1
 
-        crop_size_h, crop_size_w = crop_size // scale * scale, crop_size // scale * scale
+        crop_size_h, crop_size_w = (
+            crop_size // scale * scale,
+            crop_size // scale * scale,
+        )
 
         # adaptive step_i, step_j with overlap consideration
         num_row = (h - 1) // (crop_size_h - overlap) + 1
@@ -1557,8 +1867,15 @@ class Trainer(object):
                 if j + crop_size_w >= w:
                     j = w - crop_size_w
                     last_j = True
-                parts.append(lq[:, :, i // scale : (i + crop_size_h) // scale, j // scale : (j + crop_size_w) // scale])
-                idxes.append({'i': i, 'j': j})
+                parts.append(
+                    lq[
+                        :,
+                        :,
+                        i // scale : (i + crop_size_h) // scale,
+                        j // scale : (j + crop_size_w) // scale,
+                    ]
+                )
+                idxes.append({"i": i, "j": j})
                 j = j + step_j
             i = i + step_i
 
@@ -1569,18 +1886,21 @@ class Trainer(object):
         b, c, h, w = sr_size
 
         count_mt = torch.zeros((b, 1, h, w)).to(outs.device)
-        crop_size_h, crop_size_w = crop_size // scale * scale, crop_size // scale * scale
+        crop_size_h, crop_size_w = (
+            crop_size // scale * scale,
+            crop_size // scale * scale,
+        )
 
         for cnt, each_idx in enumerate(idxes):
-            i = each_idx['i']
-            j = each_idx['j']
+            i = each_idx["i"]
+            j = each_idx["j"]
 
             # Using slice to add weighted values in the overlapping regions
             preds[0, :, i : i + crop_size_h, j : j + crop_size_w] += outs[cnt]
-            count_mt[0, 0, i : i + crop_size_h, j : j + crop_size_w] += 1.
+            count_mt[0, 0, i : i + crop_size_h, j : j + crop_size_w] += 1.0
 
         # Avoid division by zero
         count_mt = torch.clamp(count_mt, min=1.0)
-        
+
         # Normalize to average the overlapping areas
         return (preds / count_mt).to(outs.device)
