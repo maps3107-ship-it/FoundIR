@@ -6,6 +6,7 @@ from src.model import (
     Trainer,
     Unet,
     UnetRes,
+    UnetResMoE,
     set_seed,
     DataEquilibriumScheduler,
 )
@@ -51,6 +52,19 @@ def parsr_args():
         default="v1",
         choices=["v1", "v2"],
         help="Model version: v1 (original) or v2 (with data equilibrium scheduling)",
+    )
+    parser.add_argument(
+        "--num_experts",
+        type=int,
+        default=8,
+        help="Number of experts for MoE (V2 only)",
+    )
+    parser.add_argument(
+        "--moe_routing",
+        type=str,
+        default="weighted",
+        choices=["weighted", "hard"],
+        help="MoE routing strategy: weighted (soft gating) or hard (hard selection)",
     )
     opt = parser.parse_args()
     return opt
@@ -100,16 +114,29 @@ delta_end = 1.4e-3
 if opt.version == "v2":
     train_num_steps = 1000000
     delta_end = 1.5e-3
-    print(f"V2 training: {train_num_steps} steps, delta_end={delta_end}")
+    print(
+        f"V2 training: {train_num_steps} steps, delta_end={delta_end}, experts={opt.num_experts}"
+    )
 
-model = UnetRes(
-    dim=64,
-    dim_mults=(1, 2, 4, 8),
-    num_unet=num_unet,
-    condition=condition,
-    objective=objective,
-    test_res_or_noise=test_res_or_noise,
-)
+if opt.version == "v2":
+    model = UnetResMoE(
+        dim=64,
+        dim_mults=(1, 2, 4, 8),
+        num_experts=opt.num_experts,
+        condition=condition,
+        objective=objective,
+        test_res_or_noise=test_res_or_noise,
+        moe_routing=opt.moe_routing,
+    )
+else:
+    model = UnetRes(
+        dim=64,
+        dim_mults=(1, 2, 4, 8),
+        num_unet=num_unet,
+        condition=condition,
+        objective=objective,
+        test_res_or_noise=test_res_or_noise,
+    )
 
 diffusion = ResidualDiffusion(
     model,

@@ -662,6 +662,136 @@ class UnetRes(nn.Module):
         return [self.unet0(x, time)]
 
 
+class ExpertRouter(nn.Module):
+    """Mixture-of-Experts Router for V2.
+    Routes input to appropriate expert based on learned degradation features.
+    """
+
+    def __init__(self, dim, num_experts=8, hidden_dim=128):
+        super().__init__()
+        self.num_experts = num_experts
+        self.dim = dim
+
+        self.feature_extractor = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),
+        )
+
+        self.router = nn.Sequential(
+            nn.Linear(64, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_experts),
+        )
+
+    def forward(self, x):
+        batch_size = x.shape[0]
+        features = self.feature_extractor(x)
+        features = features.view(batch_size, -1)
+        logits = self.router(features)
+        weights = F.softmax(logits, dim=-1)
+        return weights
+
+    def get_expert_index(self, x):
+        weights = self.forward(x)
+        expert_idx = torch.argmax(weights, dim=-1)
+        return expert_idx, weights
+
+
+class UnetResMoE(nn.Module):
+    """Mixture-of-Experts U-Net for FoundIR-V2.
+    Uses multiple expert networks for different degradation types.
+    """
+
+    def __init__(
+        self,
+        dim,
+        init_dim=None,
+        out_dim=None,
+        dim_mults=(1, 2, 4, 8),
+        channels=3,
+        resnet_block_groups=8,
+        learned_variance=False,
+        learned_sinusoidal_cond=False,
+        random_fourier_features=False,
+        learned_sinusoidal_dim=16,
+        num_experts=8,
+        condition=False,
+        objective="pred_res_noise",
+        test_res_or_noise="res_noise",
+        moe_routing="weighted",
+    ):
+        super().__init__()
+        self.condition = condition
+        self.channels = channels
+        self.num_experts = num_experts
+        self.moe_routing = moe_routing
+
+        default_out_dim = channels * (1 if not learned_variance else 2)
+        self.out_dim = default(out_dim, default_out_dim)
+        self.random_or_learned_sinusoidal_cond = (
+            learned_sinusoidal_cond or random_fourier_features
+        )
+        self.objective = objective
+        self.test_res_or_noise = test_res_or_noise
+
+        self.router = ExpertRouter(dim, num_experts=num_experts)
+
+        self.experts = nn.ModuleList(
+            [
+                Unet(
+                    dim,
+                    init_dim=init_dim,
+                    out_dim=out_dim,
+                    dim_mults=dim_mults,
+                    channels=channels,
+                    resnet_block_groups=resnet_block_groups,
+                    learned_variance=learned_variance,
+                    learned_sinusoidal_cond=learned_sinusoidal_cond,
+                    random_fourier_features=random_fourier_features,
+                    learned_sinusoidal_dim=learned_sinusoidal_dim,
+                    condition=condition,
+                )
+                for _ in range(num_experts)
+            ]
+        )
+
+    def forward(self, x, time):
+        if self.objective == "pred_noise":
+            time = time[1]
+        elif self.objective == "pred_res":
+            time = time[0]
+
+        if self.moe_routing == "weighted":
+            weights = self.router(x)
+            outputs = []
+            for expert in self.experts:
+                out = expert(x, time)
+                outputs.append(out[0])
+
+            outputs = torch.stack(outputs, dim=0)
+            weighted_output = torch.einsum("eb,bchw->echw", weights, outputs.squeeze(1))
+            return [weighted_output]
+
+        elif self.moe_routing == "hard":
+            expert_idx, weights = self.router.get_expert_index(x)
+            outputs = []
+            for i, expert in enumerate(self.experts):
+                mask = expert_idx == i
+                if mask.any():
+                    out = expert(x[mask], time[mask] if time.dim() > 1 else time)
+                    outputs.append((i, out[0], mask))
+
+            result = torch.zeros_like(x).repeat(1, self.out_dim // self.channels, 1, 1)
+            for i, out, mask in outputs:
+                result[mask] = out
+            return [result]
+
+        return [self.experts[0](x, time)]
+
+
 # gaussian diffusion trainer class
 
 
