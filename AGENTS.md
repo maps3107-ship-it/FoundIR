@@ -6,6 +6,33 @@ This document provides guidelines for agents working on the FoundIR codebase.
 
 FoundIR is an image restoration foundation model. It uses PyTorch for deep learning, with diffusion-based architecture for image restoration tasks.
 
+## FoundIR-V2 Support
+
+The codebase now supports FoundIR-V2 with the following features:
+
+### V1 vs V2 Comparison
+
+| Feature | V1 | V2 |
+|---------|-----|-----|
+| Architecture | Single U-Net | Mixture-of-Experts (MoE) |
+| Data Scheduling | Fixed mixture | Data Equilibrium Scheduling |
+| Training Steps | 500,000 | 1,000,000 |
+| Expert Count | N/A | Configurable (default 8) |
+
+### V2 Classes
+
+- `DataEquilibriumScheduler`: Dynamically adjusts sampling weights for different degradation types
+- `ExpertRouter`: Routes input to appropriate expert based on learned features
+- `UnetResMoE`: Multi-expert U-Net with weighted or hard routing
+
+### V2 Training Arguments
+
+```python
+--version          # 'v1' or 'v2' (default: 'v1')
+--num_experts      # Number of experts for MoE (default: 8)
+--moe_routing      # 'weighted' or 'hard' (default: 'weighted')
+```
+
 ## Environment Setup
 
 ```bash

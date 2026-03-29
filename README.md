@@ -24,6 +24,7 @@ Welcome to visit our website (专注底层视觉领域的信息服务平台) for
 <!-- ### Coming soon. -->
 
 ### 🚩 **New Features/Updates**
+- ✅ FoundIR-V2 support! See [V2 Guide](V2_GUIDE.md) for details on Data Equilibrium Scheduling and Mixture-of-Experts (MoE) architecture.
 - ✅ July, 07, 2025. Release the training set. Please fill out the [request form](https://docs.google.com/forms/d/e/1FAIpQLSfogNyffKcT_lV_eMS1r76nDFfF7mEzOsiP8SDvjVpS2-EqqQ/viewform?usp=header) to get the download link!
 - ✅ July, 02, 2025. Release the training code and [script](#computer-training)! 
 - ✅ June 26, 2025. 🎉 Our FoundIR was accepted by **ICCV 2025**!
@@ -173,6 +174,19 @@ python cal_metrics.py --inp_imgs ./dataset/restored --gt_imgs ./dataset/GT --log
 Our FoundIR is trained in two stages, please follow the steps in `train.sh` to train the model.
 ```
 sh train.sh
+```
+
+#### FoundIR-V2 (Optional)
+FoundIR-V2 introduces Data Equilibrium Scheduling and Mixture-of-Experts (MoE) architecture for improved performance across 50+ restoration tasks. See [V2 Guide](V2_GUIDE.md) for details.
+
+```bash
+# V2 Training with MoE
+python train.py --version v2 --num_experts 8 --moe_routing weighted
+```
+
+For more V2 options:
+```bash
+python train.py --version v2 --help
 ```
 
 ---
